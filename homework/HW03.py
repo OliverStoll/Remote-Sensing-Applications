@@ -1,4 +1,5 @@
 import copy
+import csv
 import json
 import os
 import numpy as np
@@ -7,7 +8,8 @@ from simple_downloader import download
 from tqdm.notebook import tqdm
 from pathlib import Path
 from PIL import Image
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report
+import sklearn.metrics as skm
 
 import torch
 import torch.nn as nn
@@ -21,7 +23,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from sklearn.metrics import f1_score, average_precision_score, ConfusionMatrixDisplay, confusion_matrix
+from sklearn.metrics import f1_score, average_precision_score, ConfusionMatrixDisplay, multilabel_confusion_matrix, plot_confusion_matrix
 
 # ## Define Customized Dataset in PyTorch
 import warnings
@@ -72,6 +74,10 @@ class UCMerced(Dataset):
         label = self.img_labels[idx]
 
         img = Image.open(img_path).convert("RGB")
+        # convert img to uint8
+
+
+
         if self.img_transform is not None:
             img = self.img_transform(img)
 
@@ -299,12 +305,7 @@ def val_epoch(model, val_loader, criterion, device):
             metrics_total["micro_map"].append(metrics["micro_map"])
             metrics_total["macro_map"].append(metrics["macro_map"])
 
-            tqdm_bar.set_postfix(loss=loss_tracker.avg, accuracy=acc_tracker.avg)
-
     report = classification_report(y_true, y_pred, zero_division=0, output_dict=True)
-    # plot confusion matrix
-    cm_display = ConfusionMatrixDisplay.from_estimator(model, y_true, y_pred)
-    cm_display.plot(cmap=plt.cm.Blues)
 
     final_metrics = {
         "micro_f1": np.mean(metrics_total["micro_f1"]),
@@ -344,7 +345,7 @@ ucm_std = [0.19303136, 0.12492529, 0.10577361]
 
 batch_size = 64
 learning_rate = 0.001
-epochs = 10
+epochs = 50
 
 
 # ## Train- and Testset Transformation (i.e., Data Augmentation)
@@ -393,65 +394,109 @@ def eval_all(tr_transform):
         device=cuda_device,
     )
 
-    # plot confusion matrix
-    # cm_display = ConfusionMatrixDisplay.from_estimator(model,)
+    # get all testset predictions
+    y_pred = []
+    y_true = []
+    test_metrics = {"micro_f1": [], "macro_f1": [], "micro_map": [], "macro_map": []}
+    for batch in test_loader:
+        images = batch["img"].to(cuda_device)
+        labels_eval = batch["label"].numpy()
+
+        logits = model(images)
+        probs = torch.sigmoid(logits)
+
+        # determine predictions by thresholding at 0.5
+        predicted = (probs.cpu().detach().numpy() > 0.5).astype(int)
+
+        # calculate scores
+        current_metrics = get_eval_metrics(labels_eval, predicted)
+        for key in test_metrics.keys():
+            test_metrics[key].append(current_metrics[key])
+
+        y_pred.append(predicted)
+        y_true.append(labels_eval)
+
+    # return single values for test
+    for key, value in test_metrics.items():
+        test_metrics[key] = np.mean(value)
+
+    print(test_metrics)
+    metrics["test"] = test_metrics
+
+    y_true = np.concatenate(y_true)
+    y_pred = np.concatenate(y_pred)
+
+    # calculate confusion matrix
+    confusion_matrix = skm.multilabel_confusion_matrix(y_true, y_pred)
+    print(confusion_matrix)
+
+    LABELS = ["airplane", "bare-soil", "buildings", "cars", "chaparral", "court", "dock", "field", "grass", "mobile-home", "pavement", "sand", "sea", "ship", "tanks", "trees", "water"]
+
+    # plot confusion matrix with display
+    plt.figure(figsize=(13, 13))
+    for i, cm in enumerate(confusion_matrix):
+        plt.subplot(4, 5, i + 1)
+        plt.xticks([], [])
+        plt.yticks([], [])
+        plt.imshow(cm, interpolation="nearest", cmap="Blues")
+        plt.title(f"{LABELS[i]}")
+    plt.show()
+
+
+    # cm_display = ConfusionMatrixDisplay.from_predictions(y_true, y_pred)
     # cm_display.plot(cmap=plt.cm.Blues)
 
-    return metrics
+    return metrics, confusion_matrix
 
 
-no_transform = transforms.Compose(
-    [
+no_transform = transforms.Compose([
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
         transforms.Normalize(mean=ucm_mean, std=ucm_std),
-    ]
-)
-
-basic_transform = transforms.Compose(
-    [
+    ])
+basic_transform = transforms.Compose([
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
         transforms.Normalize(mean=ucm_mean, std=ucm_std),
         transforms.RandomAffine(10),
         transforms.RandomAutocontrast()
-    ]
-)
-
-my_transform = transforms.Compose(
-    [
+    ])
+my_transform = transforms.Compose([
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
         transforms.Normalize(mean=ucm_mean, std=ucm_std),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(30)
-    ]
-)
-
-rand_transform = transforms.Compose(
-[
+        transforms.RandomRotation(25)
+    ])
+rand_transform = transforms.Compose([
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
         transforms.Normalize(mean=ucm_mean, std=ucm_std),
         transforms.RandAugment()
-    ]
-)
+    ])
 
 transforms_dict = {
-    # "no_transform": no_transform,
-    # "basic_transform": basic_transform,
-    # "my_transform": my_transform,
-    "rand_transform": rand_transform
+    "no_transform": no_transform,
+    "basic_transform": basic_transform,
+    "my_transform": my_transform,
+    # "rand_transform": rand_transform
 }
 
 for name, transform in transforms_dict.items():
+
     print(f"Evaluating {name}")
-    metrics = eval_all(transform)
+    metrics, cm = eval_all(transform)
+
     print(f"{name}: {metrics}")
     # dump metrics to json file
     with open(f"./output/{name}_metrics.json", "w") as f:
         json.dump(metrics, f)
+
+    # dump confusion matrix to csv file
+    with open(f"./output/{name}_confusion_matrix.csv", "w") as f:
+        writer = csv.writer(f)
+        writer.writerows(cm)
 
 
 # ## Visualize Results
